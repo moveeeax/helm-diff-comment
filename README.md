@@ -23,7 +23,7 @@ Composite Action + helm + helm-diff plugin.
 ## Usage
 
 ```yaml
-- uses: moveeeax/helm-diff-comment@v1
+- uses: cybercapybara/helm-diff-comment@v1
   with:
     release: web
     chart: ./charts/web
