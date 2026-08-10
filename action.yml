@@ -1,0 +1,101 @@
+name: helm-diff-comment
+description: >-
+  Run `helm diff upgrade` and post a sticky, collapsible PR comment with the
+  result — secret values redacted, optional gate on resource deletions.
+author: moveeeax
+branding:
+  icon: git-pull-request
+  color: blue
+
+inputs:
+  release:
+    description: Helm release name to diff against.
+    required: true
+  chart:
+    description: Chart path or reference passed to `helm diff upgrade`.
+    required: true
+  namespace:
+    description: Kubernetes namespace of the release.
+    required: false
+    default: default
+  values:
+    description: Newline-separated values files; each becomes a `-f <file>`.
+    required: false
+    default: ""
+  helm-args:
+    description: Extra raw arguments appended to `helm diff upgrade`.
+    required: false
+    default: ""
+  mask-values:
+    description: >-
+      Comma-separated regexes; every match in the diff is replaced with ***
+      (on top of automatic Secret redaction).
+    required: false
+    default: ""
+  fail-on-delete:
+    description: Fail the job if the diff would remove any resource.
+    required: false
+    default: "false"
+  comment:
+    description: Post/update the sticky PR comment.
+    required: false
+    default: "true"
+  github-token:
+    description: Token used to post the comment.
+    required: false
+    default: ${{ github.token }}
+  helm-version:
+    description: Helm version to install.
+    required: false
+    default: v3.15.4
+
+runs:
+  using: composite
+  steps:
+    - name: Install Helm
+      uses: azure/setup-helm@v4
+      with:
+        version: ${{ inputs.helm-version }}
+
+    - name: Install helm-diff plugin
+      shell: bash
+      run: |
+        if ! helm plugin list | grep -q '^diff'; then
+          helm plugin install https://github.com/databus23/helm-diff
+        fi
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.x"
+
+    - name: Compute helm diff
+      shell: bash
+      run: |
+        args=()
+        while IFS= read -r f; do
+          [ -n "$f" ] && args+=( --values "$f" )
+        done <<< "${{ inputs.values }}"
+        # helm diff exits non-zero with --detailed-exitcode; we only want the
+        # text, so never let it abort the step.
+        set +e
+        helm diff upgrade "${{ inputs.release }}" "${{ inputs.chart }}" \
+          --namespace "${{ inputs.namespace }}" \
+          --allow-unreleased --no-color \
+          ${{ inputs.helm-args }} "${args[@]}" > "$RUNNER_TEMP/helm-diff.txt" 2>&1
+        echo "helm diff captured ($(wc -l < "$RUNNER_TEMP/helm-diff.txt") lines)"
+
+    - name: Post sticky comment
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        flags=()
+        [ "${{ inputs.fail-on-delete }}" = "true" ] && flags+=( --fail-on-delete )
+        [ "${{ inputs.comment }}" = "true" ] && flags+=( --comment )
+        python3 "${{ github.action_path }}/scripts/hdc.py" \
+          --release "${{ inputs.release }}" \
+          --namespace "${{ inputs.namespace }}" \
+          --diff-file "$RUNNER_TEMP/helm-diff.txt" \
+          --mask-values "${{ inputs.mask-values }}" \
+          "${flags[@]}"

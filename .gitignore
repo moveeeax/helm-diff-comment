@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+.coverage
+
+# Editors / OS
+.DS_Store
+*.swp
+
+# Local scratch (never ignore committed fixtures)
+/tmp-diff.txt
+!testdata/**

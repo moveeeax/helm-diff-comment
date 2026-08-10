@@ -1,0 +1,37 @@
+default, web, ConfigMap (v1) has changed:
+  # Source: web/templates/configmap.yaml
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: web
+  data:
+-   greeting: hello
++   greeting: hola
+default, web, Secret (v1) has changed:
+  # Source: web/templates/secret.yaml
+  apiVersion: v1
+  kind: Secret
+  metadata:
+    name: web
+  type: Opaque
+  data:
+-   password: b2xkcGFzcw==
++   password: bmV3cGFzcw==
++   token: c3VwZXItc2VjcmV0
+default, web, Deployment (apps/v1) has changed:
+  # Source: web/templates/deployment.yaml
+  spec:
+-   replicas: 2
++   replicas: 4
+default, web-old-cache, Service (v1) has been removed:
+- # Source: web/templates/service.yaml
+- apiVersion: v1
+- kind: Service
+- metadata:
+-   name: web-old-cache
+default, web-new-hpa, HorizontalPodAutoscaler (autoscaling/v2) has been added:
++ # Source: web/templates/hpa.yaml
++ apiVersion: autoscaling/v2
++ kind: HorizontalPodAutoscaler
++ metadata:
++   name: web-new-hpa

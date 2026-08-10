@@ -1,0 +1,41 @@
+# Example: diff every environment on a PR that touches the charts.
+# Drop this in the *consuming* repo as .github/workflows/helm-diff.yml.
+name: helm-diff
+
+on:
+  pull_request:
+    paths:
+      - "charts/**"
+      - "envs/**"
+
+permissions:
+  contents: read
+  pull-requests: write   # required to post the sticky comment
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: web
+            chart: ./charts/web
+            values: envs/staging/web.yaml
+            namespace: staging
+          - release: api
+            chart: ./charts/api
+            values: envs/staging/api.yaml
+            namespace: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: moveeeax/helm-diff-comment@v1
+        with:
+          release: ${{ matrix.release }}
+          chart: ${{ matrix.chart }}
+          namespace: ${{ matrix.namespace }}
+          values: ${{ matrix.values }}
+          fail-on-delete: "true"
+          # Extra masks on top of automatic Secret redaction (e.g. AWS keys).
+          mask-values: "AKIA[0-9A-Z]{16},ghp_[A-Za-z0-9]{36}"

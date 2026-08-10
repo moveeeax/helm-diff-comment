@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: helm-diff-comment
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3 python3-pip python3-venv
+
+      - name: Create venv and install deps
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --quiet --upgrade pip
+          pip install --quiet pytest pyyaml
+
+      - name: Run unit tests
+        run: |
+          . .venv/bin/activate
+          PYTHONPATH=. python -m pytest -q
+
+      - name: Smoke test the CLI on a fixture
+        run: |
+          . .venv/bin/activate
+          PYTHONPATH=. python -m helm_diff_comment \
+            --release web \
+            --diff-file testdata/changed.txt \
+            --out /tmp/comment.md
+          echo '--- rendered comment ---'
+          cat /tmp/comment.md
+          grep -q 'password: \*\*\*' /tmp/comment.md
+          ! grep -q 'b2xkcGFzcw==' /tmp/comment.md
+
+      - name: Validate action.yml
+        run: |
+          . .venv/bin/activate
+          python -c "import yaml; a=yaml.safe_load(open('action.yml')); assert a['runs']['using']=='composite'; assert 'release' in a['inputs']"
