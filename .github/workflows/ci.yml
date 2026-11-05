@@ -6,32 +6,33 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Install Python
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends python3 python3-pip python3-venv
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
 
-      - name: Create venv and install deps
+      - name: Install deps
         run: |
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --quiet --upgrade pip
-          pip install --quiet pytest pyyaml
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet pytest pyyaml
 
       - name: Run unit tests
-        run: |
-          . .venv/bin/activate
-          PYTHONPATH=. python -m pytest -q
+        run: PYTHONPATH=. python -m pytest -q
 
       - name: Smoke test the CLI on a fixture
         run: |
-          . .venv/bin/activate
           PYTHONPATH=. python -m helm_diff_comment \
             --release web \
             --diff-file testdata/changed.txt \
@@ -43,5 +44,50 @@ jobs:
 
       - name: Validate action.yml
         run: |
-          . .venv/bin/activate
           python -c "import yaml; a=yaml.safe_load(open('action.yml')); assert a['runs']['using']=='composite'; assert 'release' in a['inputs']"
+
+  # Runs the composite action itself against a throwaway kind cluster, so the
+  # pinned Helm / helm-diff versions and the env-based input passing are
+  # exercised end to end.
+  action:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        helm-version: [v3.22.1, v4.3.1]
+    env:
+      KIND_VERSION: v0.33.0
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create kind cluster
+        run: |
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind && sudo mv kind /usr/local/bin/kind
+          kind create cluster --wait 120s
+
+      - name: Install the release to diff against
+        run: |
+          helm create /tmp/demo
+          helm install demo /tmp/demo --namespace demo --create-namespace --wait
+          printf 'replicaCount: 2\n' > /tmp/demo-values.yaml
+
+      - name: Run the action
+        uses: ./
+        with:
+          release: demo
+          chart: /tmp/demo
+          namespace: demo
+          values: /tmp/demo-values.yaml
+          helm-args: --set-string 'podAnnotations.note=hello $(touch /tmp/pwned) world'
+          comment: "false"
+          helm-version: ${{ matrix.helm-version }}
+
+      - name: Check the captured diff
+        run: |
+          cat "$RUNNER_TEMP/helm-diff.txt"
+          grep -q 'has changed' "$RUNNER_TEMP/helm-diff.txt"
+          grep -q 'replicas: 2' "$RUNNER_TEMP/helm-diff.txt"
+          # shellcheck disable=SC2016 # literal match is the point
+          grep -q 'hello $(touch /tmp/pwned) world' "$RUNNER_TEMP/helm-diff.txt"
+          test ! -e /tmp/pwned

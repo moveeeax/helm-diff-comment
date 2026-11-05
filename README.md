@@ -1,7 +1,7 @@
 # helm-diff-comment
 
 [![ci](https://github.com/moveeeax/helm-diff-comment/actions/workflows/ci.yml/badge.svg)](https://github.com/moveeeax/helm-diff-comment/actions/workflows/ci.yml)
-![python](https://img.shields.io/badge/python-3.x-blue.svg)
+![python](https://img.shields.io/badge/python-3.11%2B-blue.svg)
 [![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
 A composite GitHub Action that runs `helm diff upgrade` on a pull request and
@@ -46,7 +46,7 @@ is unit tested without a cluster or the network.
 ## Usage
 
 ```yaml
-- uses: moveeeax/helm-diff-comment@v1
+- uses: moveeeax/helm-diff-comment@v0
   with:
     release: web
     chart: ./charts/web
@@ -85,7 +85,8 @@ $ head -6 comment.md
 | `fail-on-delete` | `false`               | Fail the job if any resource would be removed.     |
 | `comment`        | `true`                | Post/update the sticky PR comment.                 |
 | `github-token`   | `${{ github.token }}` | Token used to post the comment.                    |
-| `helm-version`   | `v3.15.4`             | Helm version to install.                           |
+| `helm-version`   | `v3.22.1`             | Helm version to install.                           |
+| `helm-diff-version` | `v3.15.15`         | helm-diff plugin release tag to install.           |
 
 ## One note
 
