@@ -10,4 +10,4 @@ tested:
 * :mod:`helm_diff_comment.cli` wires the two together for the composite action.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -28,9 +28,9 @@ jobs:
             values: envs/staging/api.yaml
             namespace: staging
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: moveeeax/helm-diff-comment@v1
+      - uses: moveeeax/helm-diff-comment@v0
         with:
           release: ${{ matrix.release }}
           chart: ${{ matrix.chart }}

@@ -47,55 +47,89 @@ inputs:
   helm-version:
     description: Helm version to install.
     required: false
-    default: v3.15.4
+    default: v3.22.1
+  helm-diff-version:
+    description: >-
+      helm-diff plugin version to install (a release tag of
+      databus23/helm-diff). Ignored if a `diff` plugin is already installed.
+    required: false
+    default: v3.15.15
 
 runs:
   using: composite
   steps:
     - name: Install Helm
-      uses: azure/setup-helm@v4
+      uses: azure/setup-helm@v5
       with:
         version: ${{ inputs.helm-version }}
 
     - name: Install helm-diff plugin
       shell: bash
+      env:
+        HELM_DIFF_VERSION: ${{ inputs.helm-diff-version }}
       run: |
         if ! helm plugin list | grep -q '^diff'; then
-          helm plugin install https://github.com/databus23/helm-diff
+          flags=( --version "$HELM_DIFF_VERSION" )
+          # Helm 4 verifies plugin signatures by default and refuses git
+          # sources, which cannot be verified; Helm 3 has no --verify flag.
+          case "$(helm version --short)" in
+            v3.*) ;;
+            *) flags+=( --verify=false ) ;;
+          esac
+          helm plugin install https://github.com/databus23/helm-diff "${flags[@]}"
         fi
+        helm diff version
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v7
       with:
         python-version: "3.x"
 
     - name: Compute helm diff
       shell: bash
+      env:
+        HDC_RELEASE: ${{ inputs.release }}
+        HDC_CHART: ${{ inputs.chart }}
+        HDC_NAMESPACE: ${{ inputs.namespace }}
+        HDC_VALUES: ${{ inputs.values }}
+        HDC_HELM_ARGS: ${{ inputs.helm-args }}
       run: |
         args=()
         while IFS= read -r f; do
           [ -n "$f" ] && args+=( --values "$f" )
-        done <<< "${{ inputs.values }}"
+        done <<< "$HDC_VALUES"
+        # helm-args is split with shell-like quoting rules (shlex), but never
+        # evaluated, so `$(...)` or `;` in the input stay literal text.
+        extra=()
+        while IFS= read -r -d '' a; do
+          extra+=( "$a" )
+        done < <(python3 -c 'import shlex, sys; sys.stdout.write("".join(a + "\0" for a in shlex.split(sys.argv[1])))' "$HDC_HELM_ARGS")
         # helm diff exits non-zero with --detailed-exitcode; we only want the
         # text, so never let it abort the step.
         set +e
-        helm diff upgrade "${{ inputs.release }}" "${{ inputs.chart }}" \
-          --namespace "${{ inputs.namespace }}" \
+        helm diff upgrade "$HDC_RELEASE" "$HDC_CHART" \
+          --namespace "$HDC_NAMESPACE" \
           --allow-unreleased --no-color \
-          ${{ inputs.helm-args }} "${args[@]}" > "$RUNNER_TEMP/helm-diff.txt" 2>&1
+          "${extra[@]}" "${args[@]}" > "$RUNNER_TEMP/helm-diff.txt" 2>&1
         echo "helm diff captured ($(wc -l < "$RUNNER_TEMP/helm-diff.txt") lines)"
 
     - name: Post sticky comment
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
+        HDC_RELEASE: ${{ inputs.release }}
+        HDC_NAMESPACE: ${{ inputs.namespace }}
+        HDC_MASK_VALUES: ${{ inputs.mask-values }}
+        HDC_FAIL_ON_DELETE: ${{ inputs.fail-on-delete }}
+        HDC_COMMENT: ${{ inputs.comment }}
+        HDC_ACTION_PATH: ${{ github.action_path }}
       run: |
         flags=()
-        [ "${{ inputs.fail-on-delete }}" = "true" ] && flags+=( --fail-on-delete )
-        [ "${{ inputs.comment }}" = "true" ] && flags+=( --comment )
-        python3 "${{ github.action_path }}/scripts/hdc.py" \
-          --release "${{ inputs.release }}" \
-          --namespace "${{ inputs.namespace }}" \
+        [ "$HDC_FAIL_ON_DELETE" = "true" ] && flags+=( --fail-on-delete )
+        [ "$HDC_COMMENT" = "true" ] && flags+=( --comment )
+        python3 "$HDC_ACTION_PATH/scripts/hdc.py" \
+          --release="$HDC_RELEASE" \
+          --namespace="$HDC_NAMESPACE" \
           --diff-file "$RUNNER_TEMP/helm-diff.txt" \
-          --mask-values "${{ inputs.mask-values }}" \
+          --mask-values="$HDC_MASK_VALUES" \
           "${flags[@]}"
