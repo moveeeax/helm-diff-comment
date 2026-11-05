@@ -88,6 +88,11 @@ $ head -6 comment.md
 | `helm-version`   | `v3.22.1`             | Helm version to install.                           |
 | `helm-diff-version` | `v3.15.15`         | helm-diff plugin release tag to install.           |
 
+Helm 3 and Helm 4 both work (CI runs the action on each). On Helm 4 the plugin
+is installed with `--verify=false`, because Helm 4 cannot verify a plugin
+installed from a git URL; the pinned `helm-diff-version` tag is what keeps the
+install reproducible.
+
 ## One note
 
 `helm diff upgrade` with `--detailed-exitcode` returns a non-zero exit when there

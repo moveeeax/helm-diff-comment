@@ -69,7 +69,14 @@ runs:
         HELM_DIFF_VERSION: ${{ inputs.helm-diff-version }}
       run: |
         if ! helm plugin list | grep -q '^diff'; then
-          helm plugin install https://github.com/databus23/helm-diff --version "$HELM_DIFF_VERSION"
+          flags=( --version "$HELM_DIFF_VERSION" )
+          # Helm 4 verifies plugin signatures by default and refuses git
+          # sources, which cannot be verified; Helm 3 has no --verify flag.
+          case "$(helm version --short)" in
+            v3.*) ;;
+            *) flags+=( --verify=false ) ;;
+          esac
+          helm plugin install https://github.com/databus23/helm-diff "${flags[@]}"
         fi
         helm diff version
 
