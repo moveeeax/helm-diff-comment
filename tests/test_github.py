@@ -18,7 +18,8 @@ class FakeGitHub:
             return 200, list(self.comments)
         if method == "POST":
             self._next += 1
-            c = {"id": self._next, "body": body["body"]}
+            c = {"id": self._next, "body": body["body"],
+                 "html_url": f"https://github.com/o/r/pull/7#issuecomment-{self._next}"}
             self.comments.append(c)
             return 201, c
         if method == "PATCH":
@@ -38,8 +39,9 @@ def make_client(fake, repo="moveeeax/demo", pr=7):
 def test_upsert_creates_when_absent():
     fake = FakeGitHub()
     client = make_client(fake)
-    action, cid = client.upsert("<!-- m -->", "<!-- m -->\nhello")
+    action, cid, url = client.upsert("<!-- m -->", "<!-- m -->\nhello")
     assert action == "created"
+    assert url == f"https://github.com/o/r/pull/7#issuecomment-{cid}"
     assert any(m == "POST" for m, _, _ in fake.calls)
     assert fake.comments[-1]["body"].endswith("hello")
 
@@ -47,12 +49,13 @@ def test_upsert_creates_when_absent():
 def test_upsert_updates_existing_marker():
     fake = FakeGitHub(existing=[
         {"id": 1, "body": "unrelated"},
-        {"id": 2, "body": "<!-- m -->\nold"},
+        {"id": 2, "body": "<!-- m -->\nold", "html_url": "https://x/2"},
     ])
     client = make_client(fake)
-    action, cid = client.upsert("<!-- m -->", "<!-- m -->\nnew")
+    action, cid, url = client.upsert("<!-- m -->", "<!-- m -->\nnew")
     assert action == "updated"
     assert cid == 2
+    assert url == "https://x/2"
     assert fake.comments[1]["body"].endswith("new")
     # no second comment created
     assert len(fake.comments) == 2

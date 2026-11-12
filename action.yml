@@ -1,7 +1,8 @@
 name: helm-diff-comment
 description: >-
-  Run `helm diff upgrade` and post a sticky, collapsible PR comment with the
-  result — secret values redacted, optional gate on resource deletions.
+  Run `helm diff upgrade` (or check a release for out-of-band drift) and post a
+  sticky, collapsible PR comment with the result — secret values redacted,
+  optional gate on resource deletions.
 author: moveeeax
 branding:
   icon: git-pull-request
@@ -12,8 +13,24 @@ inputs:
     description: Helm release name to diff against.
     required: true
   chart:
-    description: Chart path or reference passed to `helm diff upgrade`.
-    required: true
+    description: >-
+      Chart path or reference passed to `helm diff upgrade`. Required in
+      `upgrade` mode, unused in `drift` mode.
+    required: false
+    default: ""
+  mode:
+    description: >-
+      `upgrade` diffs the chart against the release (`helm diff upgrade`).
+      `drift` diffs the manifest stored in the release against the live
+      objects (`kubectl diff --server-side`) to show out-of-band changes.
+    required: false
+    default: upgrade
+  revision:
+    description: >-
+      Drift mode: release revision whose manifest is compared with the
+      cluster. Empty means the current revision.
+    required: false
+    default: ""
   namespace:
     description: Kubernetes namespace of the release.
     required: false
@@ -36,6 +53,12 @@ inputs:
     description: Fail the job if the diff would remove any resource.
     required: false
     default: "false"
+  fail-on-changes:
+    description: >-
+      Fail the job if any resource differs (exit code 3). In drift mode this
+      turns the action into a scheduled drift check.
+    required: false
+    default: "false"
   comment:
     description: Post/update the sticky PR comment.
     required: false
@@ -55,6 +78,29 @@ inputs:
     required: false
     default: v3.15.15
 
+outputs:
+  changed:
+    description: Number of resources that change (drift mode, that drifted).
+    value: ${{ steps.post.outputs.changed }}
+  added:
+    description: Number of resources added (drift mode, missing from the cluster).
+    value: ${{ steps.post.outputs.added }}
+  removed:
+    description: Number of resources removed. Always 0 in drift mode.
+    value: ${{ steps.post.outputs.removed }}
+  total:
+    description: changed + added + removed.
+    value: ${{ steps.post.outputs.total }}
+  has-changes:
+    description: "`true` if any resource differs, else `false`."
+    value: ${{ steps.post.outputs.has-changes }}
+  deleted-resources:
+    description: JSON list of removed resources as `Kind/name`, e.g. `["Service/web-old-cache"]`.
+    value: ${{ steps.post.outputs.deleted-resources }}
+  comment-url:
+    description: URL of the sticky PR comment; empty when no comment was posted.
+    value: ${{ steps.post.outputs.comment-url }}
+
 runs:
   using: composite
   steps:
@@ -64,6 +110,7 @@ runs:
         version: ${{ inputs.helm-version }}
 
     - name: Install helm-diff plugin
+      if: inputs.mode != 'drift'
       shell: bash
       env:
         HELM_DIFF_VERSION: ${{ inputs.helm-diff-version }}
@@ -93,7 +140,56 @@ runs:
         HDC_NAMESPACE: ${{ inputs.namespace }}
         HDC_VALUES: ${{ inputs.values }}
         HDC_HELM_ARGS: ${{ inputs.helm-args }}
+        HDC_MODE: ${{ inputs.mode }}
+        HDC_REVISION: ${{ inputs.revision }}
       run: |
+        case "$HDC_MODE" in
+          upgrade) ;;
+          drift)
+            rev=()
+            [ -n "$HDC_REVISION" ] && rev=( --revision "$HDC_REVISION" )
+            manifest="$RUNNER_TEMP/helm-manifest.yaml"
+            helm get manifest "$HDC_RELEASE" --namespace "$HDC_NAMESPACE" "${rev[@]}" > "$manifest"
+            : > "$RUNNER_TEMP/helm-diff.txt"
+            : > "$RUNNER_TEMP/helm-live.json"
+            if ! grep -q '^kind:' "$manifest"; then
+              echo "release manifest has no objects, nothing to compare"
+              exit 0
+            fi
+            # Server-side dry-run apply of the release manifest: the API server
+            # fills in defaults and leaves status alone, so the diff only shows
+            # fields the manifest sets that differ live. --force-conflicts takes
+            # over fields another manager (kubectl edit, a controller) now owns,
+            # which is exactly the drift we want to see. Exit 1 means "differs".
+            set +e
+            kubectl diff --server-side --force-conflicts \
+              --namespace "$HDC_NAMESPACE" -f "$manifest" \
+              > "$RUNNER_TEMP/helm-diff.txt" 2> "$RUNNER_TEMP/kubectl-diff.err"
+            rc=$?
+            set -e
+            if [ "$rc" -gt 1 ]; then
+              cat "$RUNNER_TEMP/kubectl-diff.err" >&2
+              echo "::error::kubectl diff failed with exit code $rc"
+              exit "$rc"
+            fi
+            # Live objects with managedFields, to name who changed them. Best
+            # effort: a missing permission only drops the attribution.
+            kubectl get --namespace "$HDC_NAMESPACE" -f "$manifest" \
+              -o json --show-managed-fields --ignore-not-found \
+              > "$RUNNER_TEMP/helm-live.json" \
+              || echo "::warning::could not read live objects, skipping field managers"
+            echo "kubectl diff captured ($(wc -l < "$RUNNER_TEMP/helm-diff.txt") lines)"
+            exit 0
+            ;;
+          *)
+            echo "::error::mode must be upgrade or drift, got '$HDC_MODE'"
+            exit 1
+            ;;
+        esac
+        if [ -z "$HDC_CHART" ]; then
+          echo "::error::chart is required in upgrade mode"
+          exit 1
+        fi
         args=()
         while IFS= read -r f; do
           [ -n "$f" ] && args+=( --values "$f" )
@@ -114,6 +210,7 @@ runs:
         echo "helm diff captured ($(wc -l < "$RUNNER_TEMP/helm-diff.txt") lines)"
 
     - name: Post sticky comment
+      id: post
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -121,15 +218,23 @@ runs:
         HDC_NAMESPACE: ${{ inputs.namespace }}
         HDC_MASK_VALUES: ${{ inputs.mask-values }}
         HDC_FAIL_ON_DELETE: ${{ inputs.fail-on-delete }}
+        HDC_FAIL_ON_CHANGES: ${{ inputs.fail-on-changes }}
+        HDC_MODE: ${{ inputs.mode }}
+        HDC_REVISION: ${{ inputs.revision }}
         HDC_COMMENT: ${{ inputs.comment }}
         HDC_ACTION_PATH: ${{ github.action_path }}
       run: |
         flags=()
         [ "$HDC_FAIL_ON_DELETE" = "true" ] && flags+=( --fail-on-delete )
+        [ "$HDC_FAIL_ON_CHANGES" = "true" ] && flags+=( --fail-on-changes )
+        if [ "$HDC_MODE" = "drift" ]; then
+          flags+=( --live-file "$RUNNER_TEMP/helm-live.json" --revision="$HDC_REVISION" )
+        fi
         [ "$HDC_COMMENT" = "true" ] && flags+=( --comment )
         python3 "$HDC_ACTION_PATH/scripts/hdc.py" \
           --release="$HDC_RELEASE" \
           --namespace="$HDC_NAMESPACE" \
+          --mode="$HDC_MODE" \
           --diff-file "$RUNNER_TEMP/helm-diff.txt" \
           --mask-values="$HDC_MASK_VALUES" \
           "${flags[@]}"

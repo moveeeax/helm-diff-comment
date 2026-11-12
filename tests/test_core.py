@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -104,3 +105,132 @@ def test_render_delete_gate_wording(diff):
 def test_marker_is_release_scoped():
     assert core.marker("web") != core.marker("api")
     assert "release=web" in core.marker("web")
+
+
+def test_header_with_empty_namespace_is_parsed():
+    diff = ", reader, ClusterRole (rbac.authorization.k8s.io/v1) has changed:\n-  - watch\n"
+    (s,) = core.split_sections(diff)
+    assert (s.namespace, s.name, s.kind) == ("", "reader", "ClusterRole")
+
+
+def test_drift_marker_differs_from_upgrade_marker():
+    up = core.marker("web")
+    drift = core.marker("web", core.MODE_DRIFT)
+    assert up != drift
+    # The upgrade marker must not match inside a drift comment, or the two
+    # sticky comments would overwrite each other.
+    assert up not in drift
+
+
+# --- drift mode --------------------------------------------------------------
+
+DRIFT_FIXTURE = os.path.join(HERE, "..", "testdata", "drift.txt")
+LIVE_FIXTURE = os.path.join(HERE, "..", "testdata", "drift-live.json")
+
+
+@pytest.fixture()
+def drift():
+    with open(DRIFT_FIXTURE, encoding="utf-8") as fh:
+        return core.kubectl_diff_to_sections(fh.read())
+
+
+@pytest.mark.parametrize("obj,want", [
+    ("apps.v1.Deployment.demo.demo", ("demo", "demo", "Deployment", "apps/v1")),
+    ("v1.Service.demo.web", ("demo", "web", "Service", "v1")),
+    ("rbac.authorization.k8s.io.v1.ClusterRole..demo.reader",
+     ("", "demo.reader", "ClusterRole", "rbac.authorization.k8s.io/v1")),
+    ("autoscaling.v2beta2.HorizontalPodAutoscaler.ns.web",
+     ("ns", "web", "HorizontalPodAutoscaler", "autoscaling/v2beta2")),
+    ("networking.k8s.io.v1.Ingress.ns.web.example.com",
+     ("ns", "web.example.com", "Ingress", "networking.k8s.io/v1")),
+])
+def test_parse_kubectl_object(obj, want):
+    assert core.parse_kubectl_object(obj) == want
+
+
+def test_parse_kubectl_object_rejects_garbage():
+    assert core.parse_kubectl_object("not-an-object") is None
+
+
+def test_kubectl_diff_to_sections(drift):
+    sections = core.split_sections(drift)
+    assert [(s.kind, s.namespace, s.name, s.verb) for s in sections] == [
+        ("Deployment", "demo", "demo", "changed"),
+        ("Secret", "demo", "demo-creds", "changed"),
+        ("ServiceAccount", "demo", "demo", "been added"),
+        ("ClusterRole", "", "demo.reader", "changed"),
+    ]
+    # File header lines are dropped, the hunk content is kept.
+    assert "LIVE-" not in drift and "MERGED-" not in drift
+    assert "-  replicas: 3" in drift and "+  replicas: 1" in drift
+
+
+def test_kubectl_diff_without_diff_lines():
+    # Other diff tools may omit the `diff -u -N ...` line before the file pair.
+    raw = (
+        "--- /tmp/LIVE-1/v1.ConfigMap.ns.cfg\t2026-11-12 10:00:00 +0000\n"
+        "+++ /tmp/MERGED-2/v1.ConfigMap.ns.cfg\t2026-11-12 10:00:00 +0000\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-  a: 2\n"
+        "+  a: 1\n"
+    )
+    (s,) = core.split_sections(core.kubectl_diff_to_sections(raw))
+    assert (s.kind, s.name, s.verb) == ("ConfigMap", "cfg", "changed")
+
+
+def test_kubectl_diff_empty():
+    assert core.kubectl_diff_to_sections("") == ""
+    assert core.analyze(core.kubectl_diff_to_sections("")).empty
+
+
+def test_drift_redacts_secret_values(drift):
+    out = core.redact(drift)
+    assert "aGFuZGVkaXRlZA==" not in out
+    assert "b3JpZ2luYWw=" not in out
+    assert "-  password: ***" in out and "+  password: ***" in out
+
+
+def test_field_managers_skip_helm_and_status():
+    with open(LIVE_FIXTURE, encoding="utf-8") as fh:
+        live = json.load(fh)
+    ms = core.field_managers(live)
+    dep = ms[("Deployment", "demo", "demo")]
+    # Newest first; helm and the status subresource are left out.
+    assert [(m.manager, m.time) for m in dep] == [
+        ("kubectl-patch", "2026-11-12T10:01:00Z"),
+        ("kube-controller-manager", "2026-11-12T09:58:05Z"),
+    ]
+    # Only helm wrote the ClusterRole, so it has no entry.
+    assert ("ClusterRole", "", "demo.reader") not in ms
+
+
+def test_field_managers_only_filter_and_single_object():
+    with open(LIVE_FIXTURE, encoding="utf-8") as fh:
+        live = json.load(fh)
+    ms = core.field_managers(live, only={("Secret", "demo", "demo-creds")})
+    assert list(ms) == [("Secret", "demo", "demo-creds")]
+    single = core.field_managers(live["items"][1])
+    assert single[("Secret", "demo", "demo-creds")][0].manager == "kubectl-edit"
+    assert core.field_managers(None) == {}
+
+
+def test_render_drift(drift):
+    with open(LIVE_FIXTURE, encoding="utf-8") as fh:
+        live = json.load(fh)
+    r = core.analyze(drift)
+    body = core.render_comment("demo", core.redact(drift), r,
+                               mode=core.MODE_DRIFT, revision="4",
+                               managers=core.field_managers(live))
+    assert body.startswith(core.marker("demo", core.MODE_DRIFT))
+    assert "Helm drift — release `demo`" in body
+    assert "manifest of revision 4" in body
+    assert "3 drifted · 1 missing from the cluster" in body
+    assert "- `Deployment/demo/demo`: `kubectl-patch` (Update, 2026-11-12T10:01:00Z)" in body
+    assert "- `Secret/demo/demo-creds`: `kubectl-edit`" in body
+
+
+def test_render_drift_no_changes():
+    body = core.render_comment("demo", "", core.analyze(""), mode=core.MODE_DRIFT)
+    assert "No drift" in body
+    assert "the current revision" in body
+    assert "```diff" not in body

@@ -17,12 +17,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Pattern
+from typing import Dict, List, Pattern
 
 # `default, web, ConfigMap (v1) has changed:` — the trailing verb tells us
 # whether the resource was changed, created or deleted.
 HEADER_RE = re.compile(
-    r"^(?P<ns>[^,]+), (?P<name>[^,]+), (?P<kind>[\w.-]+) "
+    r"^(?P<ns>[^,]*), (?P<name>[^,]+), (?P<kind>[\w.-]+) "
     r"\((?P<api>[^)]*)\) has (?P<verb>changed|been added|been removed|been deleted):\s*$"
 )
 
@@ -197,30 +197,69 @@ def analyze(diff: str) -> Report:
 
 
 MARKER_TMPL = "<!-- helm-diff-comment:release={release} -->"
+DRIFT_MARKER_TMPL = "<!-- helm-diff-comment:release={release} mode=drift -->"
+
+MODE_UPGRADE = "upgrade"
+MODE_DRIFT = "drift"
 
 
-def marker(release: str) -> str:
-    """The hidden HTML comment that makes a comment *sticky* per release."""
-    return MARKER_TMPL.format(release=release)
+def marker(release: str, mode: str = MODE_UPGRADE) -> str:
+    """The hidden HTML comment that makes a comment *sticky* per release.
+
+    Drift reports get their own marker so a PR can carry both an upgrade diff
+    and a drift report for the same release without one overwriting the other.
+    """
+    tmpl = DRIFT_MARKER_TMPL if mode == MODE_DRIFT else MARKER_TMPL
+    return tmpl.format(release=release)
 
 
 def render_comment(release: str, redacted_diff: str, report: Report,
-                   fail_on_delete: bool = False) -> str:
-    """Render the full Markdown body posted to the PR."""
-    lines = [marker(release), f"### 🔱 Helm diff — release `{release}`", ""]
+                   fail_on_delete: bool = False, mode: str = MODE_UPGRADE,
+                   revision: str = "",
+                   managers: "Dict[tuple[str, str, str], List[FieldManager]] | None" = None,
+                   ) -> str:
+    """Render the full Markdown body posted to the PR.
+
+    In drift mode the counts mean something else: ``changed`` is a live object
+    that differs from the release manifest and ``added`` is an object the
+    manifest has but the cluster does not. *managers* (drift mode only) maps
+    ``(kind, namespace, name)`` to the non-Helm writers of that object.
+    """
+    drift = mode == MODE_DRIFT
+    title = "Helm drift" if drift else "Helm diff"
+    lines = [marker(release, mode), f"### 🔱 {title} — release `{release}`", ""]
+    if drift:
+        against = f"revision {revision}" if revision else "the current revision"
+        lines += [f"Live objects compared with the manifest of {against}.", ""]
     if report.empty:
-        lines.append("_No changes. The release is up to date._")
+        if drift:
+            lines.append("_No drift. Live objects match the release manifest._")
+        else:
+            lines.append("_No changes. The release is up to date._")
         return "\n".join(lines)
 
-    lines.append(
-        f"**{report.changed} changed · {report.added} added · "
-        f"{report.removed} removed**"
-    )
+    if drift:
+        lines.append(f"**{report.changed} drifted · {report.added} missing from the cluster**")
+    else:
+        lines.append(
+            f"**{report.changed} changed · {report.added} added · "
+            f"{report.removed} removed**"
+        )
     if report.deletions:
         listed = ", ".join(f"`{k}/{n}`" for k, n in report.deletions)
         icon = "🛑" if fail_on_delete else "⚠️"
         verb = "blocks the merge" if fail_on_delete else "will be deleted"
         lines += ["", f"{icon} **{len(report.deletions)} resource(s) {verb}:** {listed}"]
+
+    if drift and managers:
+        lines += ["", "Written outside Helm (from `managedFields`, newest first):", ""]
+        for (kind, ns, name), ms in managers.items():
+            who = ", ".join(
+                f"`{m.manager}` ({m.operation}{', ' + m.time if m.time else ''})"
+                for m in ms
+            )
+            where = f"{ns}/" if ns else ""
+            lines.append(f"- `{kind}/{where}{name}`: {who}")
 
     lines += [
         "",
@@ -233,3 +272,110 @@ def render_comment(release: str, redacted_diff: str, report: Report,
         "</details>",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Drift mode: `kubectl diff` of the stored release manifest against the cluster
+# ---------------------------------------------------------------------------
+
+# kubectl diff writes each object to <tmp>/LIVE-<rand>/<obj> and
+# <tmp>/MERGED-<rand>/<obj> and runs `diff -u -N` on the two directories, so
+# every object block opens with a `--- .../LIVE-*/<obj>` line.
+KUBECTL_FROM_RE = re.compile(r"^--- (?:\S*/)?LIVE-[^/\s]+/(?P<obj>\S+)(?:\s.*)?$")
+KUBECTL_TO_RE = re.compile(r"^\+\+\+ (?:\S*/)?MERGED-[^/\s]+/(?P<obj>\S+)(?:\s.*)?$")
+# <obj> is `[<group>.]<version>.<Kind>.<namespace>.<name>`; the namespace is
+# empty for cluster-scoped objects. Namespaces cannot contain dots, names can.
+KUBECTL_OBJ_RE = re.compile(
+    r"^(?:(?P<group>.+?)\.)?(?P<version>v\d+(?:(?:alpha|beta)\d+)?)\."
+    r"(?P<kind>[A-Z]\w*)\.(?P<ns>[^.]*)\.(?P<name>.+)$"
+)
+NEW_FILE_HUNK = "@@ -0,0 "
+
+
+def parse_kubectl_object(obj: str) -> "tuple[str, str, str, str] | None":
+    """Split a kubectl diff file name into (namespace, name, kind, apiVersion)."""
+    m = KUBECTL_OBJ_RE.match(obj)
+    if not m:
+        return None
+    group = m.group("group")
+    api = f"{group}/{m.group('version')}" if group else m.group("version")
+    return m.group("ns"), m.group("name"), m.group("kind"), api
+
+
+def kubectl_diff_to_sections(diff: str) -> str:
+    """Rewrite `kubectl diff` output into helm-diff's section format.
+
+    Each object becomes a ``<ns>, <name>, <Kind> (<api>) has changed:`` block
+    (or ``has been added:`` when the object is missing from the cluster, which
+    shows up as a ``@@ -0,0`` hunk), so redaction, counting and rendering work
+    the same as for an upgrade diff. ``-`` lines are the live object, ``+``
+    lines what the release manifest says. ``diff ...`` and ``+++`` file lines
+    are dropped; hunk headers are kept for orientation.
+    """
+    out: List[str] = []
+    lines = diff.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = KUBECTL_FROM_RE.match(line)
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if m and KUBECTL_TO_RE.match(nxt):
+            parsed = parse_kubectl_object(m.group("obj"))
+            ns, name, kind, api = parsed or ("", m.group("obj"), "Unknown", "")
+            first_hunk = lines[i + 2] if i + 2 < len(lines) else ""
+            verb = "been added" if first_hunk.startswith(NEW_FILE_HUNK) else "changed"
+            out.append(f"{ns}, {name}, {kind} ({api}) has {verb}:")
+            i += 2
+            continue
+        if line.startswith("diff ") and KUBECTL_FROM_RE.match(nxt):
+            i += 1
+            continue
+        if out:
+            out.append(line)
+        i += 1
+    return "\n".join(out) + ("\n" if out else "")
+
+
+@dataclass
+class FieldManager:
+    manager: str
+    operation: str
+    time: str
+
+
+def _is_helm_manager(name: str) -> bool:
+    return name == "helm" or name.startswith("helm-")
+
+
+def field_managers(live: object,
+                   only: "set[tuple[str, str, str]] | None" = None,
+                   ) -> "Dict[tuple[str, str, str], List[FieldManager]]":
+    """Map each live object to the managers other than Helm that wrote it.
+
+    *live* is the parsed ``kubectl get -o json --show-managed-fields`` output
+    (a ``List`` or a single object). Entries for the ``status`` subresource are
+    skipped: controllers update status all the time and that is not drift.
+    *only* restricts the result to these ``(kind, namespace, name)`` keys.
+    Managers are ordered newest first.
+    """
+    items: list = []
+    if isinstance(live, dict):
+        items = live.get("items") if live.get("kind") == "List" else [live]
+    result: Dict["tuple[str, str, str]", List[FieldManager]] = {}
+    for obj in items or []:
+        if not isinstance(obj, dict):
+            continue
+        meta = obj.get("metadata") or {}
+        key = (obj.get("kind", ""), meta.get("namespace", ""), meta.get("name", ""))
+        if only is not None and key not in only:
+            continue
+        ms = []
+        for e in meta.get("managedFields") or []:
+            name = e.get("manager", "")
+            if not name or _is_helm_manager(name) or e.get("subresource") == "status":
+                continue
+            ms.append(FieldManager(name, e.get("operation", ""), e.get("time", "")))
+        if ms:
+            ms.sort(key=lambda m: m.time, reverse=True)
+            result[key] = ms
+    return result

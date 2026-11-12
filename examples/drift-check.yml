@@ -1,0 +1,40 @@
+# Example: nightly check that nobody changed a release out of band.
+# Drop this in the *consuming* repo as .github/workflows/helm-drift.yml.
+name: helm-drift
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: web
+            namespace: production
+          - release: ingress-nginx
+            namespace: ingress
+    steps:
+      # Configure access to the cluster here (kubeconfig from a secret, or
+      # your cloud's login action). Drift mode needs get + dry-run patch on
+      # the release objects.
+
+      - id: drift
+        uses: moveeeax/helm-diff-comment@v0
+        with:
+          release: ${{ matrix.release }}
+          namespace: ${{ matrix.namespace }}
+          mode: drift
+          # No PR on a schedule: the report goes to the job summary.
+          comment: "false"
+          fail-on-changes: "true"
+
+      - if: failure() && steps.drift.outputs.has-changes == 'true'
+        run: echo "::error::${{ matrix.release }} drifted in ${{ steps.drift.outputs.changed }} object(s)"
