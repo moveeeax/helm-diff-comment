@@ -64,17 +64,24 @@ class GitHubClient:
                 return c.get("id")
         return None
 
-    def upsert(self, marker: str, body: str) -> "tuple[str, int]":
-        """Create or update the sticky comment; returns (action, comment_id)."""
+    def upsert(self, marker: str, body: str) -> "tuple[str, int, str]":
+        """Create or update the sticky comment.
+
+        Returns ``(action, comment_id, html_url)``; the URL is "" if the API
+        response did not carry one.
+        """
         existing = self.find_sticky(marker)
         if existing is not None:
             url = f"{self.api}/repos/{self.repo}/issues/comments/{existing}"
             _, data = self._transport("PATCH", url, self.token, {"body": body})
-            return "updated", data.get("id", existing) if isinstance(data, dict) else existing
+            if not isinstance(data, dict):
+                return "updated", existing, ""
+            return "updated", data.get("id", existing), data.get("html_url", "")
         url = f"{self.api}/repos/{self.repo}/issues/{self.pr}/comments"
         _, data = self._transport("POST", url, self.token, {"body": body})
-        cid = data.get("id", 0) if isinstance(data, dict) else 0
-        return "created", cid
+        if not isinstance(data, dict):
+            return "created", 0, ""
+        return "created", data.get("id", 0), data.get("html_url", "")
 
 
 def pr_number_from_event() -> Optional[int]:

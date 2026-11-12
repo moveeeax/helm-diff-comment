@@ -23,6 +23,13 @@ will actually do to the cluster *before* you merge, without leaving the PR.
 - **Deletion gate (optional):** with `fail-on-delete: true` the job fails if the
   upgrade would remove any resource, and the removed resources are called out in
   the comment.
+- **Drift check (`mode: drift`):** compares the manifest stored in the release
+  with the live objects and reports what was changed out of band since the last
+  `helm upgrade` (a `kubectl edit`, a `kubectl scale`, a deleted object), with
+  the non-Helm writer of each drifted object taken from `managedFields`. See
+  [Drift mode](#drift-mode).
+- **Step outputs:** counts, a `has-changes` flag, the deleted resources and the
+  comment URL, so later steps can label the PR or require an extra approval.
 
 ## How it works
 
@@ -77,21 +84,101 @@ $ head -6 comment.md
 | Input            | Default               | Description                                        |
 | ---------------- | --------------------- | -------------------------------------------------- |
 | `release`        | —                     | Helm release name (required).                      |
-| `chart`          | —                     | Chart path or reference (required).                |
+| `chart`          | `""`                  | Chart path or reference. Required in `upgrade` mode, unused in `drift`. |
+| `mode`           | `upgrade`             | `upgrade` (`helm diff upgrade`) or `drift` (live objects vs. release manifest). |
+| `revision`       | `""`                  | Drift mode: release revision to compare with; empty means current. |
 | `namespace`      | `default`             | Release namespace.                                 |
 | `values`         | `""`                  | Newline-separated values files; each becomes `-f`. |
 | `helm-args`      | `""`                  | Extra raw args for `helm diff upgrade`.            |
 | `mask-values`    | `""`                  | Comma-separated regexes; each match is masked.     |
-| `fail-on-delete` | `false`               | Fail the job if any resource would be removed.     |
+| `fail-on-delete` | `false`               | Fail the job if any resource would be removed (exit 2). |
+| `fail-on-changes` | `false`              | Fail the job if any resource differs (exit 3).     |
 | `comment`        | `true`                | Post/update the sticky PR comment.                 |
 | `github-token`   | `${{ github.token }}` | Token used to post the comment.                    |
 | `helm-version`   | `v3.22.1`             | Helm version to install.                           |
 | `helm-diff-version` | `v3.15.15`         | helm-diff plugin release tag to install.           |
 
+### Outputs
+
+| Output              | Example                       | Description                                              |
+| ------------------- | ----------------------------- | -------------------------------------------------------- |
+| `changed`           | `3`                           | Resources that change. In drift mode, resources that drifted. |
+| `added`             | `1`                           | Resources added. In drift mode, release objects missing from the cluster. |
+| `removed`           | `1`                           | Resources removed. Always `0` in drift mode.             |
+| `total`             | `5`                           | `changed + added + removed`.                             |
+| `has-changes`       | `true`                        | `true` if `total` is above 0, else `false`.              |
+| `deleted-resources` | `["Service/web-old-cache"]`   | JSON list of removed resources as `Kind/name`.           |
+| `comment-url`       | `https://github.com/…#issuecomment-1` | URL of the sticky comment; empty if none was posted. |
+
+Outputs are written before the `fail-on-delete` / `fail-on-changes` gates
+exit, so an `if: failure()` step can still read them.
+
+```yaml
+- id: diff
+  uses: moveeeax/helm-diff-comment@v0
+  with:
+    release: web
+    chart: ./charts/web
+- if: steps.diff.outputs.has-changes == 'false'
+  run: gh pr edit "$PR" --add-label helm:no-op
+  env:
+    GH_TOKEN: ${{ github.token }}
+    PR: ${{ github.event.pull_request.number }}
+- if: steps.diff.outputs.deleted-resources != '[]'
+  run: echo "::warning::deletes ${{ steps.diff.outputs.deleted-resources }}"
+```
+
 Helm 3 and Helm 4 both work (CI runs the action on each). On Helm 4 the plugin
 is installed with `--verify=false`, because Helm 4 cannot verify a plugin
 installed from a git URL; the pinned `helm-diff-version` tag is what keeps the
 install reproducible.
+
+## Drift mode
+
+`mode: drift` answers "what did someone change in the cluster since the last
+`helm upgrade`?" instead of "what will this chart change do?". The action runs:
+
+1. `helm get manifest <release> [--revision N]` to get the manifest Helm stored
+   for the release;
+2. `kubectl diff --server-side --force-conflicts -f <manifest>`, a server-side
+   dry-run apply of that manifest. The API server fills in its defaults and
+   leaves `status` alone, so the diff only shows fields the manifest sets whose
+   live value is different. `--force-conflicts` lets the dry run take over
+   fields another manager now owns, which is the drift itself;
+3. `kubectl get -f <manifest> -o json --show-managed-fields` to list who other
+   than Helm wrote each drifted object (`status` subresource writes are left
+   out).
+
+In the comment, `-` lines are the live object and `+` lines what the release
+manifest says, i.e. what a fresh `helm upgrade` would put back. A release object
+missing from the cluster is counted as `added` ("missing from the cluster").
+
+```yaml
+on:
+  schedule:
+    - cron: "0 6 * * *"
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      # ...configure cluster credentials first
+      - uses: moveeeax/helm-diff-comment@v0
+        with:
+          release: ingress-nginx
+          namespace: ingress
+          mode: drift
+          comment: "false"        # no PR on a schedule; the report goes to the step summary
+          fail-on-changes: "true" # red run when anything drifted
+```
+
+Limits, by design of server-side apply: a field that the manifest does not set
+(an extra label or annotation added by hand) is not reported, and objects
+created by hand outside the release are not seen. Fields a controller owns on
+purpose (for example `spec.replicas` under an HPA) are reported as drift, so
+leave such fields out of the chart. Drift mode needs
+`kubectl` on the runner (GitHub-hosted Ubuntu runners have it) and RBAC to `get`
+and dry-run `patch` the release objects; it does not install the helm-diff
+plugin.
 
 ## One note
 

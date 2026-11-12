@@ -1,0 +1,53 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "name": "demo",
+        "namespace": "demo",
+        "managedFields": [
+          {"manager": "helm", "operation": "Update", "time": "2026-11-12T09:58:00Z"},
+          {"manager": "kube-controller-manager", "operation": "Update", "subresource": "status", "time": "2026-11-12T10:01:30Z"},
+          {"manager": "kubectl-patch", "operation": "Update", "time": "2026-11-12T10:01:00Z"},
+          {"manager": "kube-controller-manager", "operation": "Update", "time": "2026-11-12T09:58:05Z"}
+        ]
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Secret",
+      "metadata": {
+        "name": "demo-creds",
+        "namespace": "demo",
+        "managedFields": [
+          {"manager": "helm", "operation": "Update", "time": "2026-11-12T09:58:00Z"},
+          {"manager": "kubectl-edit", "operation": "Update", "time": "2026-11-12T10:00:00Z"}
+        ]
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "demo",
+        "namespace": "demo",
+        "managedFields": [
+          {"manager": "kubectl-annotate", "operation": "Update", "time": "2026-11-12T10:00:00Z"}
+        ]
+      }
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "ClusterRole",
+      "metadata": {
+        "name": "demo.reader",
+        "managedFields": [
+          {"manager": "helm", "operation": "Update", "time": "2026-11-12T09:58:00Z"}
+        ]
+      }
+    }
+  ]
+}

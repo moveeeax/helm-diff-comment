@@ -44,7 +44,7 @@ jobs:
 
       - name: Validate action.yml
         run: |
-          python -c "import yaml; a=yaml.safe_load(open('action.yml')); assert a['runs']['using']=='composite'; assert 'release' in a['inputs']"
+          python -c "import yaml; a=yaml.safe_load(open('action.yml')); assert a['runs']['using']=='composite'; assert 'release' in a['inputs']; assert {'changed','added','removed','total','has-changes','deleted-resources','comment-url'} <= set(a['outputs'])"
 
   # Runs the composite action itself against a throwaway kind cluster, so the
   # pinned Helm / helm-diff versions and the env-based input passing are
@@ -73,6 +73,7 @@ jobs:
           printf 'replicaCount: 2\n' > /tmp/demo-values.yaml
 
       - name: Run the action
+        id: upgrade
         uses: ./
         with:
           release: demo
@@ -91,3 +92,43 @@ jobs:
           # shellcheck disable=SC2016 # literal match is the point
           grep -q 'hello $(touch /tmp/pwned) world' "$RUNNER_TEMP/helm-diff.txt"
           test ! -e /tmp/pwned
+          test '${{ steps.upgrade.outputs.has-changes }}' = true
+          test '${{ steps.upgrade.outputs.removed }}' = 0
+          test '${{ steps.upgrade.outputs.deleted-resources }}' = '[]'
+
+      - name: Drift check on an untouched release
+        id: clean
+        uses: ./
+        with:
+          release: demo
+          namespace: demo
+          mode: drift
+          comment: "false"
+          fail-on-changes: "true"
+          helm-version: ${{ matrix.helm-version }}
+
+      - name: Change the release out of band
+        run: |
+          test '${{ steps.clean.outputs.has-changes }}' = false
+          kubectl -n demo patch deployment demo --type merge -p '{"spec":{"replicas":3}}'
+          kubectl -n demo delete serviceaccount demo
+
+      - name: Drift check after the change
+        id: drift
+        uses: ./
+        with:
+          release: demo
+          namespace: demo
+          mode: drift
+          comment: "false"
+          helm-version: ${{ matrix.helm-version }}
+
+      - name: Check the drift report
+        run: |
+          cat "$RUNNER_TEMP/helm-diff.txt"
+          grep -q 'apps.v1.Deployment.demo.demo' "$RUNNER_TEMP/helm-diff.txt"
+          grep -q '^-  replicas: 3' "$RUNNER_TEMP/helm-diff.txt"
+          grep -q '"manager": "kubectl-patch"' "$RUNNER_TEMP/helm-live.json"
+          test '${{ steps.drift.outputs.changed }}' = 1
+          test '${{ steps.drift.outputs.added }}' = 1
+          test '${{ steps.drift.outputs.has-changes }}' = true

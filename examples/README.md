@@ -12,3 +12,6 @@ $ PYTHONPATH=. python3 -m helm_diff_comment \
     --release web --diff-file testdata/changed.txt --out /tmp/comment.md
 $ cat /tmp/comment.md
 ```
+
+- [`drift-check.yml`](./drift-check.yml) — nightly drift check of a release
+  against the cluster, failing the run when something was changed out of band.
